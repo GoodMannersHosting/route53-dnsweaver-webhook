@@ -2,6 +2,7 @@ package route53
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -32,7 +33,14 @@ func TestNormalizeFQDN(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"", "   ", "app..example.com", "app example.com", "app/../evil.com", "app\n.example.com"}
+	invalid := []string{
+		"", "   ", "app..example.com", "app example.com", "app/../evil.com", "app\n.example.com",
+		// Route53 only treats an asterisk as a wildcard when it is the whole
+		// leftmost label. Elsewhere it is stored literally and the record
+		// resolves for nothing, so it is a caller mistake, not a 502.
+		"prod*.example.com", "*prod.example.com", "a.*.example.com", "app.example.*",
+		"-app.example.com", "app-.example.com",
+	}
 	for _, in := range invalid {
 		got, err := NormalizeFQDN(in)
 		if err == nil {
@@ -122,13 +130,92 @@ func TestResourceRecordSet_TXTQuoting(t *testing.T) {
 }
 
 func TestTXTRoundTrip(t *testing.T) {
-	for _, in := range []string{`owner=dnsweaver`, `say "hi"`, `back\slash`, `spaces and = signs`} {
+	values := []string{
+		`owner=dnsweaver`, `say "hi"`, `back\slash`, `spaces and = signs`,
+		// Begins and ends with a quote without being one quoted string. The
+		// outer bytes alone would pass it through and Route53 would reject it.
+		`"a" and "b"`,
+	}
+	for _, in := range values {
 		if got := unquoteTXT(quoteTXT(in)); got != in {
 			t.Errorf("round trip of %q = %q", in, got)
 		}
 	}
 	if got := unquoteTXT(`"part-one" "part-two"`); got != "part-onepart-two" {
 		t.Errorf("multi-segment TXT = %q", got)
+	}
+}
+
+func TestIsQuotedTXT(t *testing.T) {
+	for _, v := range []string{`""`, `"plain"`, `"say \"hi\""`, `"back\\slash"`} {
+		if !isQuotedTXT(v) {
+			t.Errorf("isQuotedTXT(%s) = false, want true", v)
+		}
+	}
+	// Each of these looks quoted from the outside but is not a single
+	// character-string, so passing it through reaches Route53 malformed.
+	for _, v := range []string{``, `"`, `bare`, `"a" and "b"`, `"one" "two"`, `"trailing escape\"`} {
+		if isQuotedTXT(v) {
+			t.Errorf("isQuotedTXT(%s) = true, want false", v)
+		}
+	}
+}
+
+func TestNameSortKey(t *testing.T) {
+	if got := nameSortKey("www.example.com."); got != "com.example.www." {
+		t.Errorf("nameSortKey = %q, want the labels reversed", got)
+	}
+
+	// Route53 stores a wildcard escaped, and \052 sorts after a digit label
+	// even though a bare asterisk sorts before one. Delete depends on this to
+	// tell "not reached yet" from "already past it".
+	wildcard := nameSortKey("*.example.com.")
+	if wildcard != `com.example.\052.` {
+		t.Fatalf("wildcard key = %q, want the escaped form", wildcard)
+	}
+	if got := nameSortKey(`\052.example.com.`); got != wildcard {
+		t.Errorf("escaped spelling keyed as %q, want %q", got, wildcard)
+	}
+	if nameSortKey("0.example.com.") >= wildcard {
+		t.Error("a digit label must sort before the escaped wildcard")
+	}
+	if nameSortKey("a.example.com.") <= wildcard {
+		t.Error("a letter label must sort after the escaped wildcard")
+	}
+	if nameSortKey("APP.example.com.") != nameSortKey("app.example.com.") {
+		t.Error("case must not change the key; Route53 stores names lowercased")
+	}
+}
+
+func TestResourceRecordSet_CNAMENormalizesTarget(t *testing.T) {
+	rrset, err := resourceRecordSet(Record{
+		Hostname: "www.example.com", Type: TypeCNAME, Value: " target.example.com ", TTL: 300,
+	}, testMinTTL, testMaxTTL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Dot-terminated, matching both what SRV stores and what Route53 hands
+	// back on the next list, so a value doesn't change shape on round trip.
+	if got := aws.ToString(rrset.ResourceRecords[0].Value); got != "target.example.com." {
+		t.Errorf("CNAME value = %q, want the normalized target", got)
+	}
+}
+
+func TestResourceRecordSet_TXTLimitCountsThePayload(t *testing.T) {
+	// The quotes aren't part of the character-string, so a pre-quoted value
+	// at exactly the limit has to be accepted rather than measured as 257.
+	atLimit := `"` + strings.Repeat("a", maxTXTLen) + `"`
+	if _, err := resourceRecordSet(Record{
+		Hostname: "app.example.com", Type: TypeTXT, Value: atLimit, TTL: 300,
+	}, testMinTTL, testMaxTTL); err != nil {
+		t.Errorf("a %d-byte pre-quoted payload should fit: %v", maxTXTLen, err)
+	}
+
+	tooLong := `"` + strings.Repeat("a", maxTXTLen+1) + `"`
+	if _, err := resourceRecordSet(Record{
+		Hostname: "app.example.com", Type: TypeTXT, Value: tooLong, TTL: 300,
+	}, testMinTTL, testMaxTTL); err == nil {
+		t.Error("a pre-quoted payload over the limit should still be rejected")
 	}
 }
 
@@ -199,6 +286,11 @@ func TestToRecords_Skips(t *testing.T) {
 			AliasTarget: &r53types.AliasTarget{DNSName: aws.String("elb.amazonaws.com.")},
 		},
 		"routing policy": weighted,
+		// Route53 splits a value over 255 bytes into several quoted strings,
+		// as it does for DKIM keys. Listing concatenates them into a value
+		// the single-string writer could never reproduce, so the record would
+		// be advertised and then refused on the way back.
+		"multi-string txt": recordSet("dkim.example.com.", r53types.RRTypeTxt, `"part-one" "part-two"`),
 	}
 	for name, rs := range cases {
 		if recs := toRecords(rs); len(recs) != 0 {
@@ -225,6 +317,23 @@ func TestToRecords_SRVParses(t *testing.T) {
 	}
 	if rec.SRV == nil || rec.SRV.Priority != 10 || rec.SRV.Weight != 20 || rec.SRV.Port != 443 {
 		t.Errorf("SRV = %+v", rec.SRV)
+	}
+}
+
+func TestToRecords_SkipsMalformedSRV(t *testing.T) {
+	// Handing back a four-field string with no SRV data would advertise a
+	// record that fails validation the moment anything writes it again.
+	for name, value := range map[string]string{
+		"non-numeric fields": "not an srv value",
+		"missing target":     "10 20 443",
+		"port out of range":  "10 20 99999 target.example.com.",
+	} {
+		t.Run(name, func(t *testing.T) {
+			recs := toRecords(recordSet("_https._tcp.example.com.", r53types.RRTypeSrv, value))
+			if len(recs) != 0 {
+				t.Errorf("expected the record to be skipped, got %+v", recs)
+			}
+		})
 	}
 }
 

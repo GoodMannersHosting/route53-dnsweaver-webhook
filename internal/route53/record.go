@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,12 @@ import (
 // bad value or out-of-range TTL - so transport layers can answer 400 rather
 // than blaming the upstream.
 var ErrInvalid = errors.New("invalid record")
+
+// ErrConflict marks a well-formed request that collides with zone state this
+// provider refuses to touch, such as an alias record already sitting at the
+// name. The request isn't wrong, so transport layers answer 409 rather than
+// 400 or blaming the upstream.
+var ErrConflict = errors.New("conflicting record")
 
 // RecordType is one of the DNS record types this provider manages.
 type RecordType string
@@ -52,9 +59,10 @@ const (
 	maxTXTLen = 255
 )
 
-// Underscores appear in SRV and ACME challenge names; an asterisk is a
-// Route53 wildcard.
-var labelPattern = regexp.MustCompile(`^[A-Za-z0-9_*-]+$`)
+// Underscores appear in SRV and ACME challenge names. Hyphens are allowed
+// inside a label but not at either end. Asterisks are handled separately by
+// NormalizeFQDN, because a wildcard is only a wildcard as a whole label.
+var labelPattern = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?$`)
 
 // ParseType normalizes and validates a record type name.
 func ParseType(s string) (RecordType, error) {
@@ -76,8 +84,15 @@ func NormalizeFQDN(hostname string) (string, error) {
 	if len(h) > maxHostnameLen {
 		return "", fmt.Errorf("%w: hostname must be at most %d characters", ErrInvalid, maxHostnameLen)
 	}
-	for _, label := range strings.Split(h, ".") {
-		if label == "" || len(label) > maxLabelLen || !labelPattern.MatchString(label) {
+	for i, label := range strings.Split(h, ".") {
+		// Route53 treats an asterisk as a wildcard only when it is the whole
+		// leftmost label. Anywhere else it is stored as the literal character
+		// and the record resolves for nothing, so reject it here rather than
+		// letting the API accept a name that can never match.
+		if label == "*" && i == 0 {
+			continue
+		}
+		if len(label) > maxLabelLen || !labelPattern.MatchString(label) {
 			return "", fmt.Errorf("%w: invalid hostname %q", ErrInvalid, h)
 		}
 	}
@@ -131,15 +146,23 @@ func recordValue(rt RecordType, value string, srv *SRV) (string, error) {
 		}
 		return addr.String(), nil
 	case TypeCNAME:
-		if _, err := NormalizeFQDN(value); err != nil {
+		// Store the normalized target rather than the raw one, so a CNAME
+		// written as "Target.Example.COM" reads back as the same value SRV
+		// would have stored for it.
+		target, err := NormalizeFQDN(value)
+		if err != nil {
 			return "", fmt.Errorf("invalid cname target: %w", err)
 		}
-		return value, nil
+		return target, nil
 	case TypeTXT:
-		if len(value) > maxTXTLen {
+		// Measure the character-string Route53 will actually hold, not the
+		// caller's spelling of it: a pre-quoted value carries two extra bytes
+		// and an escaped one expands.
+		quoted := quoteTXT(value)
+		if len(unquoteTXT(quoted)) > maxTXTLen {
 			return "", fmt.Errorf("%w: txt values longer than %d bytes are not supported", ErrInvalid, maxTXTLen)
 		}
-		return quoteTXT(value), nil
+		return quoted, nil
 	case TypeSRV:
 		if srv == nil {
 			return "", fmt.Errorf("%w: srv data is required for SRV records", ErrInvalid)
@@ -177,9 +200,14 @@ func toRecords(rs r53types.ResourceRecordSet) []Record {
 		case TypeTXT:
 			rec.Value = unquoteTXT(rec.Value)
 		case TypeSRV:
-			if target, srv, ok := parseSRV(rec.Value); ok {
-				rec.Value, rec.SRV = target, srv
+			target, srv, ok := parseSRV(rec.Value)
+			if !ok {
+				// Same rule as isManageable: a value this contract cannot
+				// express is hidden rather than handed over as a four-field
+				// string that fails validation on the way back.
+				continue
 			}
+			rec.Value, rec.SRV = target, srv
 		}
 		out = append(out, rec)
 	}
@@ -230,13 +258,96 @@ func unescapeName(name string) string {
 	return b.String()
 }
 
-// quoteTXT wraps a TXT value the way Route53 expects, unless the caller
-// already supplied a quoted value.
+// escapeName renders a name the way Route53 stores it: lowercased, with every
+// character outside the set it keeps verbatim written as a \ooo octal escape.
+// It is the inverse of unescapeName, and running a name through both yields
+// the canonical form regardless of which one the caller started from.
+func escapeName(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c == '.' || c == '-' || c == '_' ||
+			(c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
+			continue
+		}
+		fmt.Fprintf(&b, `\%03o`, c)
+	}
+	return b.String()
+}
+
+// nameSortKey renders a name the way Route53 orders record sets: canonically
+// escaped with the labels reversed, so www.example.com sorts as
+// com.example.www. Comparing these keys is what tells a scan whether it has
+// reached the name it wants or already gone past it.
+//
+// Both halves matter. Escaping keeps a wildcard sorting as Route53 stores it
+// (\052, so after digits) rather than as the bare asterisk the caller wrote,
+// and the trailing dot changes the order of any name containing a character
+// below "." in ASCII.
+func nameSortKey(name string) string {
+	labels := strings.Split(strings.TrimSuffix(escapeName(unescapeName(name)), "."), ".")
+	slices.Reverse(labels)
+	return strings.Join(labels, ".") + "."
+}
+
+// quoteTXT wraps a TXT value the way Route53 expects. A value that is already
+// one well-formed quoted string is passed through so callers can supply the
+// stored form; everything else is quoted and escaped, including a value that
+// merely happens to begin and end with a quote.
 func quoteTXT(v string) string {
-	if len(v) >= 2 && strings.HasPrefix(v, `"`) && strings.HasSuffix(v, `"`) {
+	if isQuotedTXT(v) {
 		return v
 	}
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v) + `"`
+}
+
+// isQuotedTXT reports whether v is exactly one quoted character-string with
+// its interior quotes and backslashes escaped. Checking only the outer bytes
+// would pass `"a" and "b"` straight through, which Route53 then rejects.
+func isQuotedTXT(v string) bool {
+	if len(v) < 2 || v[0] != '"' || v[len(v)-1] != '"' {
+		return false
+	}
+	body := v[1 : len(v)-1]
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '\\':
+			// A trailing backslash escapes the closing quote, leaving the
+			// string unterminated.
+			if i++; i >= len(body) {
+				return false
+			}
+		case '"':
+			return false
+		}
+	}
+	return true
+}
+
+// txtSegments counts the character-strings in a stored TXT value. Route53
+// splits anything over 255 bytes into several quoted strings.
+func txtSegments(v string) int {
+	var n int
+	var quoted, escaped bool
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case escaped:
+			escaped = false
+		case quoted && c == '\\':
+			escaped = true
+		case c == '"':
+			if !quoted {
+				n++
+			}
+			quoted = !quoted
+		}
+	}
+	return n
 }
 
 // unquoteTXT reverses quoteTXT, concatenating the segments of a multi-string

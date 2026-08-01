@@ -24,8 +24,8 @@ type Provider interface {
 	Delete(ctx context.Context, hostname, recordType string) (int, error)
 }
 
-// Options configures a Server. Leaving AuthHeader or AuthToken empty disables
-// the shared-secret check.
+// Options configures a Server. Leaving both AuthHeader and AuthToken empty
+// disables the shared-secret check; setting only one is an error.
 type Options struct {
 	AuthHeader string
 	AuthToken  string
@@ -41,18 +41,25 @@ type Server struct {
 	authEnabled bool
 }
 
-// NewServer wires a Provider up to the webhook contract.
-func NewServer(p Provider, opts Options) *Server {
+// NewServer wires a Provider up to the webhook contract. Half-configured auth
+// is rejected rather than quietly serving an unprotected endpoint. config
+// already refuses that combination, so this is about keeping the insecure
+// state unrepresentable here too instead of merely unreachable from one
+// caller.
+func NewServer(p Provider, opts Options) (*Server, error) {
+	if (opts.AuthHeader == "") != (opts.AuthToken == "") {
+		return nil, errors.New("api: auth header and token must be set together")
+	}
 	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
 	s := &Server{provider: p, log: log, authHeader: opts.AuthHeader}
-	if opts.AuthHeader != "" && opts.AuthToken != "" {
+	if opts.AuthHeader != "" {
 		s.authEnabled = true
 		s.authDigest = sha256.Sum256([]byte(opts.AuthToken))
 	}
-	return s
+	return s, nil
 }
 
 // Router returns the fully wired chi router.
@@ -63,8 +70,11 @@ func (s *Server) Router() http.Handler {
 	// Deliberately no middleware.RealIP: it trusts X-Forwarded-For, which any
 	// client can set, and this service isn't guaranteed to sit behind a proxy
 	// that overwrites it.
-	r.Use(s.recoverPanics)
+	// Logging wraps the panic guard, not the other way round: a panic that
+	// unwound past logRequests would skip its trailing log call, losing the
+	// access-log line for the one request most worth having one.
 	r.Use(s.logRequests)
+	r.Use(s.recoverPanics)
 	r.Use(s.requireAuth)
 
 	r.Get("/ping", s.handlePing)
@@ -122,6 +132,12 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 					"panic", rec,
 					"path", r.URL.Path,
 					"request_id", middleware.GetReqID(r.Context()))
+				// A handler that already sent a status can't be given a clean
+				// 500; writing another would only log "superfluous
+				// WriteHeader" and append junk to a half-sent body.
+				if ww, ok := w.(middleware.WrapResponseWriter); ok && ww.Status() != 0 {
+					return
+				}
 				writeError(w, http.StatusInternalServerError, "internal error", "")
 			}
 		}()
@@ -217,6 +233,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) failChange(w http.ResponseWriter, r *http.Request, err error, hostname string) {
 	if errors.Is(err, route53.ErrInvalid) {
 		writeError(w, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	// The request is well-formed; the zone just holds something this provider
+	// won't overwrite, and retrying the same call won't change that.
+	if errors.Is(err, route53.ErrConflict) {
+		writeError(w, http.StatusConflict, err.Error(), "")
 		return
 	}
 	s.fail(w, r, http.StatusBadGateway, "route53 change failed", err, "hostname", hostname)
