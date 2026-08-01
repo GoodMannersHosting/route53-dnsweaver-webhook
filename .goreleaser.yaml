@@ -105,11 +105,13 @@ dockers_v2:
       - ghcr.io/goodmannershosting/route53-dnsweaver-webhook
     # v1.2.3 publishes 1.2.3, 1.2 and 1 so deployments can pin at whichever
     # level of churn they're willing to accept. Empty tags are dropped, so a
-    # prerelease simply doesn't move `latest`.
+    # prerelease simply doesn't move `latest`, and 0.x publishes no bare major:
+    # under semver a 0.x minor bump may break, so a `0` tag would promise a
+    # stability it can't keep.
     tags:
       - "{{ .Version }}"
       - "{{ .Major }}.{{ .Minor }}"
-      - "{{ .Major }}"
+      - "{{ if gt .Major 0 }}{{ .Major }}{{ end }}"
       - "{{ if not .Prerelease }}latest{{ end }}"
     platforms:
       - linux/amd64
