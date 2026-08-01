@@ -1,0 +1,52 @@
+[Unit]
+Description=Route53 webhook provider for dnsweaver
+Documentation=https://github.com/GoodMannersHosting/route53-dnsweaver-webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# systemd reads this as root, before the service drops to its dynamic user,
+# so a shared secret in here stays readable only by root.
+EnvironmentFile=/etc/default/route53-dnsweaver-webhook
+ExecStart=/usr/bin/route53-dnsweaver-webhook
+Restart=on-failure
+RestartSec=5s
+
+# The binary gives an in-flight Route53 call 35s to finish after SIGTERM;
+# a shorter stop timeout here would turn a clean shutdown into a SIGKILL.
+TimeoutStopSec=40s
+
+# No state to keep between runs, so let systemd allocate the account rather
+# than the package creating one. A token file pointed at by
+# WEBHOOK_AUTH_TOKEN_FILE needs SupplementaryGroups= and a matching group on
+# the file to be readable; putting the token in the environment file above
+# avoids that.
+DynamicUser=yes
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

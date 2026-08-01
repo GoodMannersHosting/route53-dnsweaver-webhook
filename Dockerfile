@@ -1,41 +1,29 @@
 # syntax=docker/dockerfile:1
 
-# --platform=$BUILDPLATFORM keeps the toolchain native and cross-compiles to
-# the target below. Without it, buildx runs this whole stage under QEMU
-# emulation for every non-native architecture.
+# There is no build stage here on purpose. GoReleaser has already compiled the
+# binary for every platform and lays them out in the build context as
+# <os>/<arch>/<binary>, so this image copies the exact bytes that get published
+# in the archives. Compiling again here would produce a second, different
+# binary of the same commit under whatever Go toolchain the base image happens
+# to carry, and the published SBOM and signature would only describe one of
+# them.
+#
+# The consequence: `docker build .` no longer works on its own, because the
+# context it needs is assembled by GoReleaser. To build the image locally:
+#
+#   goreleaser release --snapshot --clean --skip=archive,nfpm,sbom,sign
+#
+# distroless/static carries the CA bundle the AWS SDK needs for TLS and little
+# else: no shell, no package manager, and an unprivileged default user.
 #
 # Pinned by digest, not just tag: a tag can be repointed by the publisher.
 # The tag stays for readability and so Dependabot can see what to bump.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
-WORKDIR /src
-
-# Dependencies change far less often than source, so resolve them in their own
-# layer and keep the module cache between builds.
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
-
-COPY cmd/ ./cmd/
-COPY internal/ ./internal/
-
-# Stamped by the release workflow so a running container can report what it
-# is. A local `docker build .` leaves it as "dev".
-ARG VERSION=dev
-
-# TARGETARCH comes from buildx and is what makes the multi-arch release build
-# cross-compile instead of emulating.
-ARG TARGETOS
-ARG TARGETARCH
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
-    -o /out/webhook ./cmd/route53-dnsweaver-webhook
-
-# distroless/static carries the CA bundle the AWS SDK needs for TLS and little
-# else: no shell, no package manager, and an unprivileged default user.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
 
-COPY --from=build /out/webhook /usr/local/bin/webhook
+# Set by buildx for each platform in the manifest, and matches the directory
+# layout GoReleaser builds in the context.
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/route53-dnsweaver-webhook /usr/local/bin/webhook
 
 USER nonroot:nonroot
 EXPOSE 8080

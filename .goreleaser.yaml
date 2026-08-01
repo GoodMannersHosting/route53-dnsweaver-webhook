@@ -17,29 +17,181 @@ builds:
       - -trimpath
     ldflags:
       - -s -w -X main.version={{ .Version }}
-    # Linux only. This is a daemon that runs alongside dnsweaver, and the
-    # container image covers everything that isn't a bare Linux host. Adding
-    # darwin or windows here is a one-line change if that stops being true.
     goos:
       - linux
+      - darwin
+      - windows
     goarch:
       - amd64
       - arm64
+      - arm
+      - "386"
+    goarm:
+      - "7"
+    # The matrix above would otherwise produce combinations Go has no port
+    # for, or ones nobody runs a DNS daemon on.
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: darwin
+        goarch: "386"
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: "386"
     # Without this the binary embeds the build time and two builds of the
     # same commit produce different bytes.
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
   - id: default
+    ids:
+      - webhook
     formats:
       - tar.gz
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    # The Arm suffix keeps armv7 from colliding with any other arm variant
+    # added later.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
     files:
       - README.md
+
+# deb/rpm/apk install the binary plus a systemd unit and an environment file.
+# The unit is left disabled: it needs a hosted zone id before it can start.
+nfpms:
+  - id: packages
+    package_name: route53-dnsweaver-webhook
+    ids:
+      - webhook
+    formats:
+      - deb
+      - rpm
+      - apk
+    maintainer: Tyler Witlin <twitlin@witl.xyz>
+    vendor: Good Manners Hosting
+    homepage: https://github.com/GoodMannersHosting/route53-dnsweaver-webhook
+    description: dnsweaver webhook DNS provider backed by AWS Route53.
+    section: net
+    bindir: /usr/bin
+    file_name_template: "{{ .ConventionalFileName }}"
+    contents:
+      - src: packaging/systemd/route53-dnsweaver-webhook.service
+        dst: /usr/lib/systemd/system/route53-dnsweaver-webhook.service
+      - src: packaging/route53-dnsweaver-webhook.env
+        dst: /etc/default/route53-dnsweaver-webhook
+        # noreplace so an upgrade doesn't overwrite a configured zone id, and
+        # 0600 because the shared secret lives in this file.
+        type: config|noreplace
+        file_info:
+          mode: 0600
+    scripts:
+      postinstall: packaging/scripts/postinstall.sh
+      preremove: packaging/scripts/preremove.sh
+      postremove: packaging/scripts/postremove.sh
+
+# The image copies the binary built above rather than compiling its own, so
+# the container and the tarball ship identical bytes and one Go toolchain
+# produces the whole release. Needs a buildx builder; the workflow sets one up.
+dockers_v2:
+  - id: image
+    # Only the binary goes into the build context. Without this the deb, rpm
+    # and apk for each Linux architecture land there too.
+    ids:
+      - webhook
+    images:
+      - ghcr.io/goodmannershosting/route53-dnsweaver-webhook
+    # v1.2.3 publishes 1.2.3, 1.2 and 1 so deployments can pin at whichever
+    # level of churn they're willing to accept. Empty tags are dropped, so a
+    # prerelease simply doesn't move `latest`.
+    tags:
+      - "{{ .Version }}"
+      - "{{ .Major }}.{{ .Minor }}"
+      - "{{ .Major }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    # BuildKit's own SBOM attestation, which is unsigned and rides in the
+    # image index. The workflow adds signed per-architecture SBOMs on top.
+    sbom: true
+    # buildx would otherwise also push an unsigned provenance attestation.
+    # The workflow signs a GitHub provenance attestation for the same digest,
+    # so this one would only add a manifest to the index for no extra proof.
+    flags:
+      - "--provenance=false"
+    labels:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: dnsweaver webhook DNS provider backed by AWS Route53.
+      # GHCR reads this one to link the package back to the repository.
+      org.opencontainers.image.source: https://github.com/GoodMannersHosting/route53-dnsweaver-webhook
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.base.name: "{{ .BaseImage }}"
+      org.opencontainers.image.base.digest: "{{ .BaseImageDigest }}"
+
+# One SPDX document per archive and per package, named <artifact>.sbom.json.
+# Needs syft on PATH; the release workflow installs it.
+sboms:
+  - id: archives
+    artifacts: archive
+    documents:
+      - "${artifact}.sbom.json"
+    cmd: syft
+    args:
+      - "$artifact"
+      - --output
+      - spdx-json=$document
+  - id: packages
+    artifacts: package
+    documents:
+      - "${artifact}.sbom.json"
+    cmd: syft
+    args:
+      - "$artifact"
+      - --output
+      - spdx-json=$document
 
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+
+# Keyless cosign: the workflow's OIDC token identifies the signer, so there
+# is no private key to store or rotate. Every artifact is signed
+# individually, not just checksums.txt, so a single downloaded archive can be
+# verified without fetching the rest of the release.
+#
+# cosign 3 dropped --output-signature/--output-certificate in favour of one
+# Sigstore bundle per artifact, which carries the signature, the short-lived
+# certificate and the transparency log entry together. The workflow pins the
+# cosign version these arguments were written against.
+signs:
+  - id: cosign
+    cmd: cosign
+    artifacts: all
+    output: true
+    signature: "${artifact}.bundle"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+
+# The image is signed by digest rather than by tag, so the signature follows
+# the bytes even after `latest` moves. `artifacts` is left at its default,
+# which means the images built by dockers_v2. Container image types aren't
+# release-uploadable, so the blob signing above never sees them.
+docker_signs:
+  - id: cosign
+    cmd: cosign
+    output: true
+    args:
+      - sign
+      - "${artifact}@${digest}"
+      - "--yes"
 
 changelog:
   use: github

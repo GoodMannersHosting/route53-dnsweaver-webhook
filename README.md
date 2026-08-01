@@ -155,12 +155,41 @@ Tags are `1.2.3`, `1.2`, `1` and `latest`, so you can pin at whichever level
 of churn you're willing to accept. Or build it yourself:
 
 ```bash
-docker build -t route53-dnsweaver-webhook .
+goreleaser release --snapshot --clean --skip=archive,nfpm,sbom,sign
 ```
+
+That's GoReleaser rather than `docker build` because the Dockerfile copies a
+binary GoReleaser has already compiled instead of compiling its own — see
+[Releases](#releases). A snapshot build loads one image per architecture into
+your local daemon, tagged with a `-amd64` or `-arm64` suffix.
 
 The image is a static binary on `distroless/static`, so there's no shell or
 package manager in it, and it runs as `nonroot`. That also means you can't
 `docker exec` into it to debug — read the JSON logs on stdout instead.
+
+If you'd rather run it on a bare host, each release also carries `.deb`, `.rpm`
+and `.apk` packages for every Linux architecture, plus plain tarballs for
+Linux, macOS and Windows:
+
+```bash
+sudo dpkg -i route53-dnsweaver-webhook_1.0.0_amd64.deb
+sudoedit /etc/default/route53-dnsweaver-webhook   # hosted zone id, shared secret
+sudo systemctl enable --now route53-dnsweaver-webhook
+```
+
+The package puts the binary in `/usr/bin`, the unit in
+`/usr/lib/systemd/system` and a root-only (mode 0600) environment file in
+`/etc/default/route53-dnsweaver-webhook`, marked as a config file so upgrades
+leave your settings alone. It isn't enabled on install: without a hosted zone
+id the service can only fail, so enabling it is your call once it's
+configured.
+
+The unit runs under `DynamicUser=yes`, which means there's no service account
+to create and nothing on disk it can write. The one consequence worth knowing:
+if you set `WEBHOOK_AUTH_TOKEN_FILE` instead of putting the token in the
+environment file, the dynamic user won't be able to read that file without a
+`SupplementaryGroups=` drop-in. systemd reads the environment file as root
+before dropping privileges, so a secret in there is fine.
 
 Or use the included `docker-compose.example.yml`, which wires up Traefik +
 dnsweaver + this webhook + two sample containers (one using plain Traefik
@@ -298,11 +327,13 @@ vulnerabilities in code that hasn't changed. Four jobs run in parallel:
 - `Vulnerability scan` — `govulncheck`, which reports only vulnerabilities
   actually reachable from this code rather than everything in the module
   graph.
-- `Container image` — builds the Dockerfile, then starts the image with a
-  throwaway token and no AWS credentials and asserts that an unauthenticated
-  `GET /ping` returns `401`. The runtime image is distroless, so there's no
-  shell to debug a bad build after the fact; this catches an image that
-  builds but can't boot.
+- `Container image` — builds the image through GoReleaser, exactly as a
+  release does, then starts it with a throwaway token and no AWS credentials
+  and asserts that an unauthenticated `GET /ping` returns `401`. The runtime
+  image is distroless, so there's no shell to debug a bad build after the
+  fact; this catches an image that builds but can't boot. Because it runs
+  GoReleaser, it also fails on a broken `.goreleaser.yaml` rather than leaving
+  that to discover at release time.
 
 The golangci-lint and govulncheck versions are pinned in the workflow rather
 than tracking latest, so a tool release can't turn an unrelated pull request
@@ -315,7 +346,7 @@ are mutable and the action owner can silently repoint them, which is how the
 `trivy-action` and `kics-github-action` compromises worked. The trailing
 `# v1.2.3` comment isn't decoration: Dependabot reads it to work out the
 semver of a SHA pin, and updates the SHA and the comment together. The
-Dockerfile's base images are pinned the same way, by digest with the tag kept
+Dockerfile's base image is pinned the same way, by digest with the tag kept
 alongside for readability.
 
 Dependabot (`.github/dependabot.yml`) watches Go modules, action versions and
@@ -385,18 +416,36 @@ Publishing a GitHub Release creates the tag and triggers
 `.github/workflows/release.yml`. Draft the notes in the UI first; GoReleaser
 appends its generated changelog rather than replacing what you wrote.
 
-Two jobs run. `Binaries` runs GoReleaser (`.goreleaser.yaml`), which builds
-static `linux/amd64` and `linux/arm64` binaries, wraps them in tarballs with
-a `checksums.txt`, and uploads them onto the release. Builds are reproducible:
-`mod_timestamp` pins the embedded timestamp to the commit, so the same commit
-produces the same bytes. `Container image` builds the same Dockerfile for both
-architectures and pushes to
-`ghcr.io/goodmannershosting/route53-dnsweaver-webhook`. The build stage is
-pinned to `$BUILDPLATFORM` and cross-compiles, so the arm64 image doesn't cost
-a QEMU-emulated Go build.
+One job does everything, driven by `.goreleaser.yaml`. It builds static
+binaries for Linux (amd64, arm64, armv7, 386), macOS (amd64, arm64) and
+Windows (amd64, arm64), wraps them in tarballs — zip files on Windows — turns
+each Linux build into a `.deb`, `.rpm` and `.apk`, and uploads all of it with a
+`checksums.txt`. Builds are reproducible: `mod_timestamp` pins the embedded
+timestamp to the commit, so the same commit produces the same bytes.
 
-Both jobs sign a build provenance attestation, so anyone can check an artifact
-really came from this repository and commit rather than from someone's laptop:
+The container image comes out of the same run. GoReleaser's `dockers_v2`
+drives `docker buildx` to push a `linux/amd64` and `linux/arm64` manifest to
+`ghcr.io/goodmannershosting/route53-dnsweaver-webhook`, and the Dockerfile
+copies the binaries already built above rather than compiling its own. That
+matters for more than speed: the container and the tarball now contain
+identical bytes, so a signature or SBOM published for one describes the other.
+Building inside the image, as this repo used to, meant a second compile under
+the base image's Go toolchain, which drifts from the version in `go.mod`.
+
+The tradeoff is that `docker build .` no longer works on its own, since the
+build context is a temporary directory GoReleaser assembles. Build the image
+locally with `goreleaser release --snapshot --clean --skip=archive,nfpm,sbom,sign`,
+which is also what CI does before its smoke test.
+
+Note that `dockers_v2` is still marked experimental upstream and is slated to
+replace `dockers` in GoReleaser v3, so expect a config rename eventually.
+
+### Provenance, signatures and SBOMs
+
+Every release artifact carries three things beyond the artifact itself.
+
+A build provenance attestation from GitHub, which says which repository,
+workflow and commit produced the file:
 
 ```bash
 gh attestation verify route53-dnsweaver-webhook_1.0.0_linux_amd64.tar.gz \
@@ -407,6 +456,56 @@ gh attestation verify \
   --repo GoodMannersHosting/route53-dnsweaver-webhook
 ```
 
+A keyless cosign signature, which says who signed it. There's no private key
+anywhere in the repo or its secrets: the release workflow's own OIDC identity
+is the signer, and Sigstore issues it a certificate that lives for a few
+minutes. Each artifact gets its own `<artifact>.bundle` holding the signature,
+that certificate and the transparency log entry, so one archive can be checked
+without downloading the rest of the release:
+
+```bash
+cosign verify-blob \
+  --bundle route53-dnsweaver-webhook_1.0.0_linux_amd64.tar.gz.bundle \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/GoodMannersHosting/route53-dnsweaver-webhook/\.github/workflows/release\.yml@' \
+  route53-dnsweaver-webhook_1.0.0_linux_amd64.tar.gz
+
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/GoodMannersHosting/route53-dnsweaver-webhook/\.github/workflows/release\.yml@' \
+  ghcr.io/goodmannershosting/route53-dnsweaver-webhook:1.0.0
+```
+
+The image signature is made against the digest rather than a tag, so it
+follows the bytes even after `latest` moves; verifying by tag works because
+cosign resolves the tag to that digest first.
+
+And an SBOM listing the Go modules compiled into that build, as SPDX 2.3 JSON
+produced by [syft](https://github.com/anchore/syft). Archives and packages get
+a plain `<artifact>.sbom.json` file on the release, signed like everything
+else. The image gets two: BuildKit attaches its own SBOM to the manifest
+index, which is convenient for registry tooling but unsigned, and the workflow
+adds a signed attestation per architecture on top, attached to that
+architecture's manifest. The signed ones are per-architecture because syft
+resolves a multi-arch index to whichever platform it happens to be running on:
+
+```bash
+digest=$(docker buildx imagetools inspect \
+  ghcr.io/goodmannershosting/route53-dnsweaver-webhook:1.0.0 \
+  --format '{{ json .Manifest }}' \
+  | jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')
+
+cosign verify-attestation --type spdxjson \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/GoodMannersHosting/route53-dnsweaver-webhook/\.github/workflows/release\.yml@' \
+  "ghcr.io/goodmannershosting/route53-dnsweaver-webhook@${digest}"
+```
+
+The workflow pins syft and cosign to specific versions, because the arguments
+in `.goreleaser.yaml` are version-specific — cosign 3 dropped the separate
+`--output-signature`/`--output-certificate` flags that cosign 2 used in favour
+of the bundle above.
+
 The version is stamped into the binary at link time, so a running container
 can tell you what it is. It appears in the startup log line and via the flag:
 
@@ -414,7 +513,9 @@ can tell you what it is. It appears in the startup log line and via the flag:
 docker run --rm ghcr.io/goodmannershosting/route53-dnsweaver-webhook:latest --version
 ```
 
-A plain `go build` or a local `docker build .` reports `dev`.
+A plain `go build` reports `dev`; a snapshot build reports something like
+`0.0.0-SNAPSHOT-6031241`, since GoReleaser stamps the version through
+`-ldflags` for the image and the archives alike.
 
 The generated changelog groups commits by the prefixes used elsewhere in the
 repo: `feat`, `fix`, and the `deps`/`ci`/`docker` prefixes Dependabot is
