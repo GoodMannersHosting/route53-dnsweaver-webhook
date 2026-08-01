@@ -28,6 +28,10 @@ jobs:
       packages: write # push to GHCR
       id-token: write # cosign signatures and the attestations
       attestations: write
+      # Attesting a pushed image also files a storage record, which lists the
+      # image on the organisation's linked artifacts page. Without this the
+      # attestation still lands, but the action warns that it couldn't.
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
