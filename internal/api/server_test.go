@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -66,7 +67,13 @@ func testRouter(p Provider, opts Options) http.Handler {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return NewServer(p, opts).Router()
+	s, err := NewServer(p, opts)
+	if err != nil {
+		// Every caller here passes a valid combination; a failure means the
+		// test itself is wrong.
+		panic(err)
+	}
+	return s.Router()
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -177,6 +184,67 @@ func TestPanicIsRecoveredAsJSON(t *testing.T) {
 	}
 }
 
+func TestNewServerRejectsHalfConfiguredAuth(t *testing.T) {
+	// The dangerous half is a header with no token, which used to leave the
+	// endpoint open. Both directions are rejected so neither can be reached.
+	for name, opts := range map[string]Options{
+		"header without token": {AuthHeader: "X-Webhook-Token"},
+		"token without header": {AuthToken: "s3cret"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewServer(&fakeProvider{}, opts); err == nil {
+				t.Error("expected an error rather than a silently unprotected endpoint")
+			}
+		})
+	}
+}
+
+func TestPanicIsStillAccessLogged(t *testing.T) {
+	// A panic used to unwind past the logging middleware, so the one request
+	// most worth a log line was the only one that never got one.
+	var logged bytes.Buffer
+	h := testRouter(&fakeProvider{panicOnUpsert: true},
+		Options{Logger: slog.New(slog.NewJSONHandler(&logged, nil))})
+
+	rec := do(t, h, http.MethodPost, "/create",
+		`{"hostname":"app.example.com","type":"A","value":"203.0.113.10"}`, nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(logged.String(), `"msg":"request"`) {
+		t.Errorf("no access-log line for the panicking request: %s", logged.String())
+	}
+	if !strings.Contains(logged.String(), `"status":500`) {
+		t.Errorf("access-log line did not record the 500: %s", logged.String())
+	}
+}
+
+func TestRecoverPanicsLeavesAPartialResponseAlone(t *testing.T) {
+	s, err := NewServer(&fakeProvider{}, Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Once a status is on the wire a clean 500 is no longer possible, and
+	// writing one would only log "superfluous WriteHeader" and tack an error
+	// object onto a half-sent body.
+	h := s.logRequests(s.recoverPanics(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"partial":`))
+		panic("boom")
+	})))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want the 202 already sent", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "internal error") {
+		t.Errorf("appended an error body to a partial response: %s", rec.Body)
+	}
+}
+
 func TestListEmptyReturnsArray(t *testing.T) {
 	rec := do(t, testRouter(&fakeProvider{}, Options{}), http.MethodGet, "/list", "", nil)
 	if got := strings.TrimSpace(rec.Body.String()); got != "[]" {
@@ -239,6 +307,57 @@ func TestCreateSurfacesValidationAs400(t *testing.T) {
 		`{"hostname":"app.example.com","type":"A","value":"nope"}`, nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateSurfacesConflictAs409(t *testing.T) {
+	// The request is fine; the zone holds an alias the provider won't
+	// overwrite. Retrying won't help, so this is neither 400 nor 502.
+	p := &fakeProvider{upsertErr: errors.Join(route53.ErrConflict,
+		errors.New("app.example.com A is an alias or routing-policy record"))}
+
+	rec := do(t, testRouter(p, Options{}), http.MethodPost, "/create",
+		`{"hostname":"app.example.com","type":"A","value":"203.0.113.10"}`, nil)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestDeleteSurfacesValidationAs400(t *testing.T) {
+	p := &fakeProvider{deleteErr: errors.Join(route53.ErrInvalid,
+		errors.New(`invalid record: invalid hostname "bad host"`))}
+
+	rec := do(t, testRouter(p, Options{}), http.MethodDelete, "/delete",
+		`{"hostname":"bad host"}`, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestUpstreamErrorIsNotLeakedOnAnyRoute(t *testing.T) {
+	secret := errors.New("AccessDenied: arn:aws:iam::123456789012:role/secret is not authorized")
+
+	cases := []struct {
+		name, method, path, body string
+		provider                 *fakeProvider
+	}{
+		{"list", http.MethodGet, "/list", "", &fakeProvider{listErr: secret}},
+		{"create", http.MethodPost, "/create",
+			`{"hostname":"app.example.com","type":"A","value":"203.0.113.10"}`,
+			&fakeProvider{upsertErr: secret}},
+		{"delete", http.MethodDelete, "/delete",
+			`{"hostname":"app.example.com"}`, &fakeProvider{deleteErr: secret}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, testRouter(tc.provider, Options{}), tc.method, tc.path, tc.body, nil)
+			if rec.Code != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502", rec.Code)
+			}
+			if strings.Contains(rec.Body.String(), "123456789012") {
+				t.Errorf("response leaked upstream detail: %s", rec.Body)
+			}
+		})
 	}
 }
 

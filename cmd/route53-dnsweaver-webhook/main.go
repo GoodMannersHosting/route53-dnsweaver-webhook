@@ -37,7 +37,11 @@ import (
 var version = "dev"
 
 const (
-	shutdownTimeout = 15 * time.Second
+	// Above the provider's longest per-call budget (a 30s list), so a Route53
+	// call already in flight when SIGTERM arrives can finish instead of being
+	// abandoned mid-change and reported as a failed exit. Container runtimes
+	// need a matching grace period or they send SIGKILL first.
+	shutdownTimeout = 35 * time.Second
 
 	// Read/write budgets sit above the provider's per-call timeouts so a slow
 	// upstream still yields a response body.
@@ -84,11 +88,14 @@ func run(ctx context.Context, args []string) error {
 			"hint", "set WEBHOOK_AUTH_HEADER and WEBHOOK_AUTH_TOKEN(_FILE)")
 	}
 
-	srv := api.NewServer(provider, api.Options{
+	srv, err := api.NewServer(provider, api.Options{
 		AuthHeader: cfg.AuthHeader,
 		AuthToken:  cfg.AuthToken,
 		Logger:     logger,
 	})
+	if err != nil {
+		return err
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr(),

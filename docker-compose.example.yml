@@ -68,6 +68,10 @@ services:
     # API.
     networks:
       - dns
+    # Docker's 10s default would SIGKILL the process partway through draining.
+    # This has to exceed the webhook's own 35s shutdown budget, which in turn
+    # covers the slowest Route53 call it can have in flight.
+    stop_grace_period: 40s
     read_only: true
     cap_drop:
       - ALL

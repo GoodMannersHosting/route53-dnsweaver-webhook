@@ -4,6 +4,7 @@ package route53
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -30,6 +31,11 @@ const (
 	// namePageSize is how many record sets to pull when inspecting a single
 	// name. Route53 stores at most a handful of types per name.
 	namePageSize = 20
+
+	// maxNamePages bounds a single-name scan. Route53 positions the cursor at
+	// or after the name asked for, so one page is the normal case; this only
+	// stops a cursor that fails to advance.
+	maxNamePages = 50
 )
 
 // Provider reads and writes records in one hosted zone.
@@ -103,10 +109,34 @@ func (p *Provider) Upsert(ctx context.Context, rec Record) error {
 	ctx, cancel := context.WithTimeout(ctx, changeTimeout)
 	defer cancel()
 
+	if err := p.checkUpsertTarget(ctx, aws.ToString(rrset.Name), rrset.Type); err != nil {
+		return err
+	}
+
 	return p.applyChanges(ctx, []r53types.Change{{
 		Action:            r53types.ChangeActionUpsert,
 		ResourceRecordSet: rrset,
 	}})
+}
+
+// checkUpsertTarget refuses to overwrite a record set this provider cannot
+// represent. An UPSERT replaces whatever already sits at the name and type,
+// and List hides alias and routing-policy records, so without this check a
+// caller sees no record for a hostname fronted by an alias, asks for one to
+// be created, and the alias is destroyed. Delete already pays for a lookup
+// before writing; so does this.
+func (p *Provider) checkUpsertTarget(ctx context.Context, fqdn string, rt r53types.RRType) error {
+	existing, err := p.recordSetsAtName(ctx, fqdn)
+	if err != nil {
+		return err
+	}
+	for _, rs := range existing {
+		if rs.Type == rt && !isManageable(rs) {
+			return fmt.Errorf("%w: %s %s is an alias or routing-policy record",
+				ErrConflict, strings.TrimSuffix(fqdn, "."), rt)
+		}
+	}
+	return nil
 }
 
 // Delete removes every manageable record at hostname, optionally narrowed to
@@ -137,6 +167,9 @@ func (p *Provider) Delete(ctx context.Context, hostname, recordType string) (int
 
 	changes := make([]r53types.Change, 0, len(existing))
 	for i := range existing {
+		if !isManageable(existing[i]) {
+			continue
+		}
 		if wanted != "" && RecordType(existing[i].Type) != wanted {
 			continue
 		}
@@ -162,37 +195,51 @@ func (p *Provider) applyChanges(ctx context.Context, changes []r53types.Change) 
 	return err
 }
 
-// recordSetsAtName returns every manageable record set stored under fqdn.
-// Route53 lists record sets in sorted order, so everything sharing a name is
-// contiguous and the scan can stop as soon as the name changes.
+// recordSetsAtName returns every record set stored under fqdn, including ones
+// this provider will not modify; callers filter those with isManageable.
+//
+// Route53 orders record sets by reversed labels and begins a listing at the
+// first name greater than or equal to the cursor, so everything sharing a
+// name is contiguous. The scan skips past anything sorting before the target
+// instead of reading the first mismatch as "not there", because the cursor
+// lands early whenever the caller's spelling of a name differs from the form
+// Route53 stores. Reporting an existing record as absent would turn a failed
+// delete into a silent success.
 func (p *Provider) recordSetsAtName(ctx context.Context, fqdn string) ([]r53types.ResourceRecordSet, error) {
+	target := nameSortKey(fqdn)
 	in := &awsr53.ListResourceRecordSetsInput{
-		HostedZoneId:    aws.String(p.zoneID),
-		StartRecordName: aws.String(fqdn),
+		HostedZoneId: aws.String(p.zoneID),
+		// Lowercased because Route53 stores names in lowercase, and an
+		// uppercase cursor sorts before every one of them.
+		StartRecordName: aws.String(strings.ToLower(fqdn)),
 		MaxItems:        aws.Int32(namePageSize),
 	}
 
 	var found []r53types.ResourceRecordSet
-	for {
+	for page := 0; page < maxNamePages; page++ {
 		resp, err := p.client.ListResourceRecordSets(ctx, in)
 		if err != nil {
 			return nil, err
 		}
 		for _, rs := range resp.ResourceRecordSets {
-			if !sameName(aws.ToString(rs.Name), fqdn) {
+			name := aws.ToString(rs.Name)
+			if sameName(name, fqdn) {
+				found = append(found, rs)
+				continue
+			}
+			if nameSortKey(name) > target {
 				return found, nil
 			}
-			if isManageable(rs) {
-				found = append(found, rs)
-			}
 		}
-		if !resp.IsTruncated || !sameName(aws.ToString(resp.NextRecordName), fqdn) {
+		if !resp.IsTruncated || nameSortKey(aws.ToString(resp.NextRecordName)) > target {
 			return found, nil
 		}
 		in.StartRecordName = resp.NextRecordName
 		in.StartRecordType = resp.NextRecordType
 		in.StartRecordIdentifier = resp.NextRecordIdentifier
 	}
+	return nil, fmt.Errorf("listing %s: cursor did not reach the name within %d pages",
+		strings.TrimSuffix(fqdn, "."), maxNamePages)
 }
 
 // isManageable reports whether a record set can be round-tripped through the
@@ -208,7 +255,17 @@ func isManageable(rs r53types.ResourceRecordSet) bool {
 		return false
 	}
 	switch RecordType(rs.Type) {
-	case TypeA, TypeAAAA, TypeCNAME, TypeTXT, TypeSRV:
+	case TypeA, TypeAAAA, TypeCNAME, TypeSRV:
+		return true
+	case TypeTXT:
+		// Route53 splits a value over 255 bytes into several quoted strings.
+		// Listing concatenates them, but a write can only emit one string, so
+		// such a record would be advertised and then refused on the way back.
+		for _, rr := range rs.ResourceRecords {
+			if txtSegments(aws.ToString(rr.Value)) > 1 {
+				return false
+			}
+		}
 		return true
 	default:
 		// NS, SOA, MX, CAA and friends are deliberately invisible.

@@ -29,14 +29,20 @@ contract; writing a whole new label-watcher would be reinventing that.
 
 - Implements `GET /ping`, `GET /list`, `POST /create`, `PUT /update`,
   `DELETE /delete` exactly as dnsweaver's webhook client calls them.
-- Supports `A`, `AAAA`, `CNAME`, `TXT`, and `SRV` records.
+- Supports `A`, `AAAA`, `CNAME`, `TXT`, and `SRV` records. `CNAME` and `SRV`
+  targets are stored dot-terminated, which is the form Route53 hands back on
+  the next `/list`, so a value doesn't change shape on round trip.
 - Uses Route53 `UPSERT` for create/update, so repeated reconciliation
   (e.g. on dnsweaver restart) is idempotent.
 - Looks up the existing record before deleting (Route53 requires an exact
   name/type/value match for `DELETE` changes) and treats deleting an
   absent record as success.
 - Validates every request before it reaches Route53: hostname shape, `A`/
-  `AAAA` values as real IP addresses, TTL bounds, and body size.
+  `AAAA` values as real IP addresses, TTL bounds, and body size. Wildcards
+  are only accepted as a whole leftmost label, since that is the only place
+  Route53 treats `*` as a wildcard rather than a literal character, so
+  `prod*.example.com` is a `400` here instead of a record that resolves for
+  nothing.
 - Optional shared-secret header check, matching dnsweaver's own
   `AUTH_HEADER`/`AUTH_TOKEN` webhook config. The header name and token
   must be configured together; setting only one is a startup error rather
@@ -50,8 +56,9 @@ contract; writing a whole new label-watcher would be reinventing that.
 
 ## Records it deliberately ignores
 
-`GET /list` skips, and `DELETE /delete` refuses to touch, any record set
-that can't be expressed as a flat hostname/type/value triple:
+`GET /list` skips, `DELETE /delete` refuses to touch, and `POST /create` and
+`PUT /update` refuse to overwrite any record set that can't be expressed as a
+flat hostname/type/value triple:
 
 - Alias records (Route53 alias-to-ELB/CloudFront/S3).
 - Routing-policy records — weighted, latency, geolocation, failover, and
@@ -59,9 +66,23 @@ that can't be expressed as a flat hostname/type/value triple:
 - Traffic-policy instances.
 - Record types outside `A`, `AAAA`, `CNAME`, `TXT`, `SRV` (so `NS`, `SOA`,
   `MX`, `CAA` and friends are left alone).
+- `TXT` record sets Route53 stores as several quoted strings, which is what
+  it does to any value over 255 bytes. Listing one would concatenate the
+  segments into a value a write could never reproduce.
+- `SRV` rdata that isn't the four fields this contract expects (priority,
+  weight, port, target). Reporting one as a bare string would advertise a
+  record that fails validation the moment anything writes it back.
 
 Without this, dnsweaver would see an alias record as an `A` record with an
 empty value and "repair" it into a plain record, destroying the alias.
+
+The write side matters as much as the read side, and for the same reason.
+Hiding an alias from `/list` is exactly what makes dnsweaver believe the
+hostname has no record and ask for one to be created, and a bare Route53
+`UPSERT` replaces whatever already sits at that name and type. So a write
+checks the target first and answers `409` rather than clobbering it. That
+costs one extra Route53 lookup per create or update; `DELETE` already paid
+for the same lookup.
 
 ## What it doesn't do (yet)
 
@@ -71,7 +92,8 @@ empty value and "repair" it into a plain record, destroying the alias.
   extend `recordValue` to build an `AliasTarget` when the value looks like
   an AWS resource DNS name.
 - TXT values over 255 bytes (Route53 requires splitting those into
-  multiple quoted segments). Such values are rejected with a `400`.
+  multiple quoted segments). Such values are rejected with a `400`, and
+  existing ones are hidden rather than misreported.
 - Multi-value record sets are listed as one entry per value, but a
   create/update writes a single value and replaces the whole set.
 
@@ -220,10 +242,10 @@ internal/api/                    chi router, middleware, webhook handlers
 
 `internal/api` depends on `internal/route53` for the record types and talks
 to it through a `Provider` interface it declares itself, so the handlers can
-be tested against a fake with no AWS credentials. The provider returns
-validation failures wrapped in `route53.ErrInvalid`, which is how the API
-layer decides between `400` and `502` without duplicating the validation
-rules.
+be tested against a fake with no AWS credentials. The provider wraps
+validation failures in `route53.ErrInvalid` and refusals to overwrite zone
+state in `route53.ErrConflict`, which is how the API layer picks between
+`400`, `409` and `502` without duplicating the rules.
 
 ## Per-container DNS targets
 
@@ -335,6 +357,23 @@ gh api -X PUT repos/GoodMannersHosting/route53-dnsweaver-webhook/branches/main/p
 EOF
 ```
 
+That `PUT` writes the entire protection rule, so treat it as a one-time
+bootstrap rather than something to re-run. The nulls above are not
+placeholders for "leave alone" — replaying it later clears any review
+requirement or push restriction added in the meantime. Once the branch is
+protected, change the required checks on their own:
+
+```bash
+gh api -X PATCH \
+  repos/GoodMannersHosting/route53-dnsweaver-webhook/branches/main/protection/required_status_checks \
+  --input - <<'EOF'
+{
+  "strict": true,
+  "contexts": ["Test", "Lint", "Vulnerability scan", "Container image"]
+}
+EOF
+```
+
 The auto-merge workflow triggers on `pull_request` rather than
 `pull_request_target`, and never checks out the repository. It runs with
 write permissions, so it deliberately never executes any code from the
@@ -397,3 +436,7 @@ public or grant pull access to whoever needs it.
 - Upstream AWS errors are logged, not returned. Clients get a generic
   `502`/`503`; check the service logs for the Route53 error and request
   ID.
+- Shutdown waits up to 35 seconds so an in-flight Route53 call can finish,
+  which is longer than the 10 seconds Docker grants by default. Give the
+  container a matching `stop_grace_period`, as the compose example does, or
+  it gets `SIGKILL`ed mid-drain.
