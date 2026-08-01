@@ -1,6 +1,10 @@
 module github.com/goodmannershosting/route53-dnsweaver-webhook
 
-go 1.26.0
+// The patch version is deliberate. CI installs exactly this toolchain via
+// setup-go's go-version-file, and the stdlib in 1.26.0 through 1.26.4 carries
+// crypto/tls, crypto/x509 and net/http advisories that govulncheck reports as
+// reachable from this code.
+go 1.26.5
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.43.2
