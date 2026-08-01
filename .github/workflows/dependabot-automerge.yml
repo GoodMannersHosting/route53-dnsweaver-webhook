@@ -1,0 +1,50 @@
+name: Dependabot auto-merge
+
+# Deliberately `pull_request` rather than `pull_request_target`: this job runs
+# with write permissions, and pull_request_target would run it against the base
+# branch with access to real secrets. This workflow also never checks out the
+# repository, so no code from the updated dependency is executed here.
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Approve and enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Majors deliberately fall through to a human: they carry breaking
+      # changes that a green test suite won't necessarily catch.
+      #
+      # `gh pr merge --auto` queues the merge rather than performing it. The
+      # PR still has to satisfy branch protection, which is what actually
+      # holds it until CI passes. Without required status checks configured
+      # on the default branch, this merges straight away.
+      - name: Approve and queue merge
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
+          steps.meta.outputs.update-type == 'version-update:semver-patch'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
+
+      - name: Leave majors for review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Major version update, so auto-merge is disabled. Needs a manual review."

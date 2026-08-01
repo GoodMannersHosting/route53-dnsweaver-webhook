@@ -1,0 +1,73 @@
+version: 2
+
+project_name: route53-dnsweaver-webhook
+
+before:
+  hooks:
+    - go mod download
+    - go mod verify
+
+builds:
+  - id: webhook
+    main: ./cmd/route53-dnsweaver-webhook
+    binary: route53-dnsweaver-webhook
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    # Linux only. This is a daemon that runs alongside dnsweaver, and the
+    # container image covers everything that isn't a bare Linux host. Adding
+    # darwin or windows here is a one-line change if that stops being true.
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    # Without this the binary embeds the build time and two builds of the
+    # same commit produce different bytes.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    # Matches the commit-message prefixes set in .github/dependabot.yml, so
+    # auto-merged updates land in one section instead of scattering.
+    - title: Dependencies
+      regexp: '^.*?(deps|docker|ci)(\(.+\))??!?:.+$'
+      order: 2
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^Merge "
+
+release:
+  # Publishing the release is what triggers this, so the release already
+  # exists. Append the generated changelog to whatever notes were written by
+  # hand rather than replacing them.
+  mode: append
+  replace_existing_artifacts: true

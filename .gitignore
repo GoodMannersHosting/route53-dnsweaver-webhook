@@ -1,0 +1,12 @@
+# Shared secret referenced by docker-compose.example.yml
+/secrets/
+
+# Build output
+/route53-dnsweaver-webhook
+/webhook
+
+# GoReleaser
+/dist/
+
+# Local editor/agent state
+/.cursor/

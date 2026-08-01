@@ -1,0 +1,73 @@
+version: 2
+
+updates:
+  # Go modules. Minor and patch updates are batched into a few grouped PRs
+  # that the auto-merge workflow can land unattended; majors are excluded
+  # from every group so they arrive individually and get read by a human.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 20
+    labels: ["dependencies", "go"]
+    commit-message:
+      prefix: "deps"
+    # Let a release sit before picking it up. A compromised or broken
+    # version is usually yanked within days, and nothing here is urgent
+    # enough to be first in line. Security updates ignore cooldown.
+    cooldown:
+      default-days: 5
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      aws-sdk:
+        patterns: ["github.com/aws/aws-sdk-go-v2*"]
+        update-types: ["minor", "patch"]
+      golang-x:
+        patterns: ["golang.org/x/*"]
+        update-types: ["minor", "patch"]
+      # Catch-all for everything else: chi, viper and their transitive deps.
+      go-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Workflow action versions. These run with repository write permissions,
+  # so keeping them current matters as much as the application's own deps.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "ci"
+    cooldown:
+      default-days: 5
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Base images in the Dockerfile: the Go builder and distroless runtime.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "docker"
+    cooldown:
+      default-days: 5
+    groups:
+      docker-images:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

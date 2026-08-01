@@ -1,0 +1,8 @@
+# Deny everything, then allow back only what the build needs. An allow-list
+# keeps local state - AWS config, mounted secrets, .git - out of the build
+# context by default rather than by remembering to exclude each one.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/

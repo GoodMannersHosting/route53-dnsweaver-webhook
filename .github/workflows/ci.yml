@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets the security jobs catch newly disclosed vulnerabilities in code
+  # that hasn't changed.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -w needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # -shuffle=on surfaces tests that only pass in declaration order.
+      - name: Test
+        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -n 1
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pinned: an unpinned linter turns a golangci-lint release into a
+      # surprise red build on an unrelated PR. Bump this deliberately.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # govulncheck reports only vulnerabilities that are actually reachable
+      # from this code, so a finding here is worth acting on.
+      #
+      # The tool is pinned, but the vulnerability database it queries is
+      # fetched at run time, so a pinned binary still sees newly published
+      # advisories.
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: docker build -t webhook:ci .
+
+      # The image is distroless, so there is no shell to debug a bad build
+      # after the fact. Prove the binary starts, validates its config and
+      # rejects unauthenticated callers before trusting the build.
+      - name: Smoke test
+        run: |
+          token=$(openssl rand -hex 16)
+          docker run -d --name webhook-ci -p 18080:8080 \
+            -e ROUTE53_HOSTED_ZONE_ID=Z0123456789ABCDEFGHI \
+            -e WEBHOOK_AUTH_HEADER=X-Webhook-Token \
+            -e WEBHOOK_AUTH_TOKEN="$token" \
+            webhook:ci
+
+          for _ in $(seq 1 30); do
+            # Any HTTP response means the listener is up; 401 is expected here.
+            if curl -s -o /dev/null "http://127.0.0.1:18080/ping" --max-time 2; then
+              break
+            fi
+            sleep 1
+          done
+
+          status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/ping")
+          if [ "$status" != "401" ]; then
+            echo "::error::expected 401 for an unauthenticated /ping, got $status"
+            exit 1
+          fi
+
+      - name: Container logs
+        if: always()
+        run: docker logs webhook-ci || true

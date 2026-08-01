@@ -1,0 +1,116 @@
+# Example stack: Traefik routes HTTP, dnsweaver watches container labels and
+# decides what DNS should look like, and this webhook applies the result to
+# Route53.
+#
+# Before running:
+#
+#   mkdir -p secrets && openssl rand -hex 32 | tr -d '\n' > secrets/webhook_token.txt
+#
+# then set ROUTE53_HOSTED_ZONE_ID, AWS_REGION and the domains below, and give
+# the webhook AWS credentials (see the IAM roles section of the README).
+
+services:
+  traefik:
+    image: traefik:v3.3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    ports:
+      - "80:80"
+    volumes:
+      # Read-only, but still full API access. For anything beyond a lab, put a
+      # docker-socket-proxy in front of this and of dnsweaver.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - edge
+
+  dnsweaver:
+    image: ghcr.io/maxfield-allison/dnsweaver:latest
+    restart: unless-stopped
+    depends_on:
+      - route53-webhook
+    environment:
+      - DNSWEAVER_INSTANCES=route53
+      - DNSWEAVER_ROUTE53_TYPE=webhook
+      - DNSWEAVER_ROUTE53_URL=http://route53-webhook:8080
+      - DNSWEAVER_ROUTE53_AUTH_HEADER=X-Webhook-Token
+      - DNSWEAVER_ROUTE53_AUTH_TOKEN_FILE=/run/secrets/webhook_token
+      - DNSWEAVER_ROUTE53_DOMAINS=*.example.com
+      # Stack-wide default, used by containers that only carry Traefik labels.
+      - DNSWEAVER_ROUTE53_RECORD_TYPE=A
+      - DNSWEAVER_ROUTE53_TARGET=203.0.113.10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets:
+      - webhook_token
+    networks:
+      - edge
+      - dns
+
+  route53-webhook:
+    # Pin to a released version in anything you care about; :latest is here
+    # to keep the example short. To run your own build instead, drop the
+    # image line and use `build: .`.
+    image: ghcr.io/goodmannershosting/route53-dnsweaver-webhook:latest
+    restart: unless-stopped
+    environment:
+      - ROUTE53_HOSTED_ZONE_ID=Z0123456789ABCDEFGHI
+      - ROUTE53_DEFAULT_TTL=300
+      - WEBHOOK_AUTH_HEADER=X-Webhook-Token
+      - WEBHOOK_AUTH_TOKEN_FILE=/run/secrets/webhook_token
+      - AWS_REGION=us-east-1
+    secrets:
+      - webhook_token
+    # No published ports: only dnsweaver needs to reach it. The network is not
+    # marked internal because the container still needs egress to the Route53
+    # API.
+    networks:
+      - dns
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # For local development against a shared config profile. On EC2/ECS/EKS
+    # the SDK picks up the instance, task, or pod role with no config here.
+    # volumes:
+    #   - ${HOME}/.aws:/home/nonroot/.aws:ro
+    # environment:
+    #   - AWS_PROFILE=my-profile
+
+  # Plain Traefik labels: dnsweaver reads the hostname out of the router rule
+  # and points it at DNSWEAVER_ROUTE53_TARGET.
+  whoami:
+    image: traefik/whoami
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami.rule=Host(`whoami.example.com`)
+      - traefik.http.routers.whoami.entrypoints=web
+    networks:
+      - edge
+
+  # dnsweaver labels override the stack-wide target for this container alone.
+  api:
+    image: traefik/whoami
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`api.example.com`)
+      - traefik.http.routers.api.entrypoints=web
+      - dnsweaver.records.api.hostname=api.example.com
+      - dnsweaver.records.api.type=A
+      - dnsweaver.records.api.target=203.0.113.42
+      - dnsweaver.records.api.ttl=60
+    networks:
+      - edge
+
+networks:
+  edge:
+  dns:
+
+secrets:
+  webhook_token:
+    file: ./secrets/webhook_token.txt
